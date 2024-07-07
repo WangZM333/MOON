@@ -85,7 +85,7 @@ def record_net_data_stats(y_train, net_dataidx_map, logdir):
     print('std:', np.std(data_list))
     logger.info('Data statistics: %s' % str(net_cls_counts))
 
-    return net_cls_counts
+    return net_cls_counts  # 每个客户端持有的数据中每个类别的数量
 
 
 def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
@@ -107,7 +107,7 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
     elif partition == "noniid-labeldir" or partition == "noniid":
         min_size = 0
         min_require_size = 10
-        K = 10
+        K = 10  # 类别数量
         if dataset == 'cifar100':
             K = 100
         elif dataset == 'tinyimagenet':
@@ -120,13 +120,13 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
         while min_size < min_require_size:
             idx_batch = [[] for _ in range(n_parties)]
             for k in range(K):
-                idx_k = np.where(y_train == k)[0]
+                idx_k = np.where(y_train == k)[0]  # 标签为k的索引列表
                 np.random.shuffle(idx_k)
-                proportions = np.random.dirichlet(np.repeat(beta, n_parties))
+                proportions = np.random.dirichlet(np.repeat(beta, n_parties))  # 使用迪利克雷分布生成每个客户端持有数据比例
                 proportions = np.array([p * (len(idx_j) < N / n_parties) for p, idx_j in zip(proportions, idx_batch)])
                 proportions = proportions / proportions.sum()
                 proportions = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
-                idx_batch = [idx_j + idx.tolist() for idx_j, idx in zip(idx_batch, np.split(idx_k, proportions))]
+                idx_batch = [idx_j + idx.tolist() for idx_j, idx in zip(idx_batch, np.split(idx_k, proportions))]  # 为每个客户端分配对应的数据
                 min_size = min([len(idx_j) for idx_j in idx_batch])
                 # if K == 2 and n_parties <= 10:
                 #     if np.min(proportions) < 200:
@@ -137,7 +137,7 @@ def partition_data(dataset, datadir, logdir, partition, n_parties, beta=0.4):
             np.random.shuffle(idx_batch[j])
             net_dataidx_map[j] = idx_batch[j]
 
-    traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map, logdir)
+    traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map, logdir)  # 客户端训练数据每个类别的数量
     return (X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts)
 
 

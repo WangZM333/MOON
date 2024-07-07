@@ -9,23 +9,21 @@ import os
 import copy
 import datetime
 import random
-
-
 from model import *
 from utils import *
 
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='resnet50', help='neural network used in training')
-    parser.add_argument('--dataset', type=str, default='cifar100', help='dataset used for training')
+    parser.add_argument('--model', type=str, default='simple-cnn', help='neural network used in training')
+    parser.add_argument('--dataset', type=str, default='cifar10', help='dataset used for training')
     parser.add_argument('--net_config', type=lambda x: list(map(int, x.split(', '))))
-    parser.add_argument('--partition', type=str, default='homo', help='the data partitioning strategy')
+    parser.add_argument('--partition', type=str, default='noniid', help='the data partitioning strategy')
     parser.add_argument('--batch-size', type=int, default=64, help='input batch size for training (default: 64)')
     parser.add_argument('--lr', type=float, default=0.1, help='learning rate (default: 0.1)')
-    parser.add_argument('--epochs', type=int, default=5, help='number of local epochs')
-    parser.add_argument('--n_parties', type=int, default=2, help='number of workers in a distributed cluster')
-    parser.add_argument('--alg', type=str, default='fedavg',
+    parser.add_argument('--epochs', type=int, default=10, help='number of local epochs')
+    parser.add_argument('--n_parties', type=int, default=10, help='number of workers in a distributed cluster')
+    parser.add_argument('--alg', type=str, default='moon',
                         help='communication strategy: fedavg/fedprox')
     parser.add_argument('--comm_round', type=int, default=50, help='number of maximum communication roun')
     parser.add_argument('--init_seed', type=int, default=0, help="Random seed")
@@ -39,7 +37,7 @@ def get_args():
     parser.add_argument('--device', type=str, default='cuda:0', help='The device to run the program')
     parser.add_argument('--log_file_name', type=str, default=None, help='The log file name')
     parser.add_argument('--optimizer', type=str, default='sgd', help='the optimizer')
-    parser.add_argument('--mu', type=float, default=1, help='the mu parameter for fedprox or moon')
+    parser.add_argument('--mu', type=float, default=5, help='the mu parameter for fedprox or moon')
     parser.add_argument('--out_dim', type=int, default=256, help='the output dimension for the projection layer')
     parser.add_argument('--temperature', type=float, default=0.5, help='the temperature parameter for contrastive loss')
     parser.add_argument('--local_max_epoch', type=int, default=100, help='the number of epoch for local optimal training')
@@ -55,6 +53,7 @@ def get_args():
     parser.add_argument('--save_model',type=int,default=0)
     parser.add_argument('--use_project_head', type=int, default=1)
     parser.add_argument('--server_momentum', type=float, default=0, help='the server momentum (FedAvgM)')
+    parser.add_argument('--inner', action='store_false', help='aggregation method')
     args = parser.parse_args()
     return args
 
@@ -98,9 +97,9 @@ def init_nets(net_configs, n_parties, args, device='cpu'):
 
     model_meta_data = []
     layer_type = []
-    for (k, v) in nets[0].state_dict().items():
-        model_meta_data.append(v.shape)
-        layer_type.append(k)
+    for (k, v) in nets[0].state_dict().items():  # k:模型层名 v:层数据
+        model_meta_data.append(v.shape)  # 记录模型每层尺寸大小
+        layer_type.append(k)  # 模型每层名称
 
     return nets, model_meta_data, layer_type
 
@@ -269,16 +268,19 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
                               weight_decay=args.reg)
 
     criterion = nn.CrossEntropyLoss().cuda()
-    # global_net.to(device)
+    global_net.to(device)
 
     for previous_net in previous_nets:
         previous_net.cuda()
     global_w = global_net.state_dict()
 
     cnt = 0
-    cos=torch.nn.CosineSimilarity(dim=-1)
-    # mu = 0.001
+    cos=torch.nn.CosineSimilarity(dim=-1)  # 创建一个计算余弦相似度的对象
 
+    local_grad = [param.clone().detach() - param.clone().detach() for param in net.parameters()]  # 创建一个全0梯度列表
+
+    # mu = 0.001
+    # 本地训练
     for epoch in range(epochs):
         epoch_loss_collector = []
         epoch_loss1_collector = []
@@ -291,11 +293,11 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
             target.requires_grad = False
             target = target.long()
 
-            _, pro1, out = net(x)
-            _, pro2, _ = global_net(x)
+            _, pro1, out = net(x)  # z
+            _, pro2, _ = global_net(x)  # z_glob
 
-            posi = cos(pro1, pro2)
-            logits = posi.reshape(-1,1)
+            posi = cos(pro1, pro2)  # sim(z,z_glob), 1行
+            logits = posi.reshape(-1,1)  # 1列
 
             for previous_net in previous_nets:
                 previous_net.cuda()
@@ -327,6 +329,8 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
         epoch_loss2 = sum(epoch_loss2_collector) / len(epoch_loss2_collector)
         logger.info('Epoch: %d Loss: %f Loss1: %f Loss2: %f' % (epoch, epoch_loss, epoch_loss1, epoch_loss2))
 
+    for idx, param in enumerate(net.parameters()):
+        local_grad[idx] += param.grad.clone().detach()
 
     for previous_net in previous_nets:
         previous_net.to('cpu')
@@ -337,10 +341,10 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
     logger.info('>> Test accuracy: %f' % test_acc)
     net.to('cpu')
     logger.info(' ** Training complete **')
-    return train_acc, test_acc
+    return train_acc, test_acc, local_grad
 
-
-def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, global_model = None, prev_model_pool = None, server_c = None, clients_c = None, round=None, device="cpu"):
+# 客户端本地训练
+def local_train_net(nets, local_grads, args, net_dataidx_map, train_dl=None, test_dl=None, global_model = None, prev_model_pool = None, server_c = None, clients_c = None, round=None, device="cpu"):
     avg_acc = 0.0
     acc_list = []
     if global_model:
@@ -367,8 +371,12 @@ def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, gl
             prev_models=[]
             for i in range(len(prev_model_pool)):
                 prev_models.append(prev_model_pool[i][net_id])
-            trainacc, testacc = train_net_fedcon(net_id, net, global_model, prev_models, train_dl_local, test_dl, n_epoch, args.lr,
+            trainacc, testacc, local_grad = train_net_fedcon(net_id, net, global_model, prev_models, train_dl_local, test_dl, n_epoch, args.lr,
                                                   args.optimizer, args.mu, args.temperature, args, round, device=device)
+            # local_grad_tensor = torch.cat([grad.flatten() for grad in local_grad])
+            # local_grads[net_id] = local_grad_tensor
+            local_grads[net_id] = copy.deepcopy(local_grad)
+
 
         elif args.alg == 'local_training':
             trainacc, testacc = train_net(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args,
@@ -386,10 +394,11 @@ def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, gl
         for param_index, param in enumerate(server_c.parameters()):
             server_c_collector[param_index] = new_server_c_collector[param_index]
         server_c.to('cpu')
-    return nets
+    return nets, local_grads
 
 
 if __name__ == '__main__':
+    # 联邦学习初始化
     args = get_args()
     mkdirs(args.logdir)
     mkdirs(args.modeldir)
@@ -424,13 +433,14 @@ if __name__ == '__main__':
     random.seed(seed)
 
     logger.info("Partitioning data")
+    # 划分数据
     X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts = partition_data(
         args.dataset, args.datadir, args.logdir, args.partition, args.n_parties, beta=args.beta)
 
-    n_party_per_round = int(args.n_parties * args.sample_fraction)
-    party_list = [i for i in range(args.n_parties)]
+    n_party_per_round = int(args.n_parties * args.sample_fraction)  # 每轮选中客户端数量
+    party_list = [i for i in range(args.n_parties)]  # 客户端列表
     party_list_rounds = []
-    if n_party_per_round != args.n_parties:
+    if n_party_per_round != args.n_parties:  # 参与方数量大于每轮训练数随机选择
         for i in range(args.comm_round):
             party_list_rounds.append(random.sample(party_list, n_party_per_round))
     else:
@@ -449,9 +459,9 @@ if __name__ == '__main__':
     data_size = len(test_ds_global)
 
     logger.info("Initializing nets")
-    nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.n_parties, args, device='cpu')
+    nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.n_parties, args, device='cpu')  # 获取每个客户端的模型、模型每层的名字和尺寸
 
-    global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 1, args, device='cpu')
+    global_models, global_model_meta_data, global_layer_type = init_nets(args.net_config, 1, args, device='cpu')  # 获取全局模型、全局模型每层的名字和尺寸
     global_model = global_models[0]
     n_comm_rounds = args.comm_round
     if args.load_model_file and args.alg != 'plot_visual':
@@ -471,19 +481,19 @@ if __name__ == '__main__':
                 for net_id, net in old_nets.items():
                     net.load_state_dict(checkpoint['pool' + str(nets_id) + '_'+'net'+str(net_id)])
                 old_nets_pool.append(old_nets)
-        elif args.load_first_net:
+        elif args.load_first_net:  # 第一轮训练
             if len(old_nets_pool) < args.model_buffer_size:
-                old_nets = copy.deepcopy(nets)
-                for _, net in old_nets.items():
+                old_nets = copy.deepcopy(nets)  # 旧模型和原模型相同
+                for _, net in old_nets.items():  # 把旧模型设置为不需要梯度
                     net.eval()
                     for param in net.parameters():
                         param.requires_grad = False
 
         for round in range(n_comm_rounds):
             logger.info("in comm round:" + str(round))
-            party_list_this_round = party_list_rounds[round]
+            party_list_this_round = party_list_rounds[round]  # 本轮进行训练的客户端
 
-            global_model.eval()
+            global_model.eval()  # 把全全局模型设置为不需要梯度1
             for param in global_model.parameters():
                 param.requires_grad = False
             global_w = global_model.state_dict()
@@ -491,19 +501,21 @@ if __name__ == '__main__':
             if args.server_momentum:
                 old_w = copy.deepcopy(global_model.state_dict())
 
-            nets_this_round = {k: nets[k] for k in party_list_this_round}
+            if args.inner:
+                w_prev = copy.deepcopy(global_model.state_dict())
+            local_grads = {}
+
+            nets_this_round = {k: nets[k] for k in party_list_this_round}  # 存储本轮训练每个客户端的模型
             for net in nets_this_round.values():
-                net.load_state_dict(global_w)
+                net.load_state_dict(global_w) # 加载本轮全局模型参数
 
-
-            local_train_net(nets_this_round, args, net_dataidx_map, train_dl=train_dl, test_dl=test_dl, global_model = global_model, prev_model_pool=old_nets_pool, round=round, device=device)
-
-
+            # 每个客户端本地训练，返回net
+            local_train_net(nets_this_round, local_grads, args, net_dataidx_map, train_dl=train_dl, test_dl=test_dl, global_model = global_model, prev_model_pool=old_nets_pool, round=round, device=device0)
 
             total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
-            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]
+            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]  # 每个客户端持有数据集数量权重
 
-
+            # 服务器聚合客户端模型参数
             for net_id, net in enumerate(nets_this_round.values()):
                 net_para = net.state_dict()
                 if net_id == 0:
@@ -519,6 +531,96 @@ if __name__ == '__main__':
                     delta_w[key] = old_w[key] - global_w[key]
                     moment_v[key] = args.server_momentum * moment_v[key] + (1-args.server_momentum) * delta_w[key]
                     global_w[key] = old_w[key] - moment_v[key]
+
+            # 计算出全局模型参数之后可以求出全局模型梯度，然后根据每个客户端的本地参数计算出本地梯度，随后计算余弦相似度进行内积聚合
+            if args.inner:
+                glob_grad = None
+
+                # # 展平梯度计算余弦相似度
+                # # 计算全局梯度
+                # for net_id, grad in enumerate(local_grads.values()):
+                #     net_grad = copy.deepcopy(local_grads[net_id])
+                #     if glob_grad is None:
+                #         glob_grad = net_grad * fed_avg_freqs[net_id]
+                #     else:
+                #         glob_grad += net_grad * fed_avg_freqs[net_id]
+                # # 计算余弦相似度
+                # cos = torch.nn.CosineSimilarity(dim=-1)  # 创建一个计算余弦相似度的对象
+                # sim = {}
+                # sum_sim = 0
+                # for i in party_list_this_round:
+                #     sim[i] = cos(glob_grad, local_grads[i])
+                #     sum_sim += sim[i]
+                # # 内积聚合
+                # for net_id, net in enumerate(nets_this_round.values()):
+                #     net_para = net.state_dict()
+                #     if net_id == 0:
+                #         for key in net_para:
+                #             global_w[key] = net_para[key].to(device) * (sim[net_id] / sum_sim)
+                #     else:
+                #         for key in net_para:
+                #             global_w[key] += net_para[key].to(device) * (sim[net_id] / sum_sim)
+
+                # 不展平梯度计算余弦相似度
+                for net_id, net in enumerate(local_grads.values()):
+                    net_grad = copy.deepcopy(local_grads[net_id])
+                    if glob_grad is None:
+                        glob_grad = {}
+                        for i in range(len(net_grad)):
+                            glob_grad[i] = net_grad[i] * fed_avg_freqs[net_id]
+                    else:
+                        for i in range(len(net_grad)):
+                            glob_grad[i] += net_grad[i] * fed_avg_freqs[net_id]
+                # 计算余弦相似度
+                cos = torch.nn.CosineSimilarity(dim=-1)  # 创建一个计算余弦相似度的对象
+                sim = {}
+                sum_sim = None
+                for i in party_list_this_round:
+                    sim[i] = []
+                    for j in range(len(glob_grad)):
+                        sim[i].append(cos(glob_grad[j], local_grads[i][j]))
+                    if sum_sim is None:
+                        sum_sim = copy.deepcopy(sim[i])
+                    else:
+                        for k in range(len(sum_sim)):
+                            sum_sim[k] += sim[i][k]
+                # 内积聚合
+                for net_id, net in enumerate(nets_this_round.values()):
+                    net_para = net.state_dict()
+                    if net_id == 0:
+                        i = 0
+                        for key in net_para:
+                            global_w[key] = net_para[key].to(device) * (sim[net_id][i]/sum_sim[i]).unsqueeze(-1)
+                            i += 1
+                    else:
+                        i = 0
+                        for key in net_para:
+                            global_w[key] += net_para[key].to(device) * (sim[net_id][i]/sum_sim[i]).unsqueeze(-1)
+                            i += 1
+
+                # # 计算全局梯度
+                # for net_id, grad in enumerate(local_grads.values()):
+                #     net_grad = copy.deepcopy(local_grads[net_id])
+                #     if glob_grad is None:
+                #         glob_grad = net_grad * fed_avg_freqs[net_id]
+                #     else:
+                #         glob_grad += net_grad * fed_avg_freqs[net_id]
+                # # 展平梯度计算内积
+                # inner_product = {}
+                # sum_inner_product = 0
+                # for i in party_list_this_round:
+                #     inner_product[i] = torch.dot(glob_grad, local_grads[i])
+                #     sum_inner_product += inner_product[i]
+                # # 内积聚合
+                # for net_id, net in enumerate(nets_this_round.values()):
+                #     net_para = copy.deepcopy(net.state_dict())
+                #     if net_id == 0:
+                #         for key in net_para:
+                #             global_w[key] = net_para[key].to(device) * (inner_product[net_id]/sum_inner_product)
+                #     else:
+                #         for key in net_para:
+                #             global_w[key] += net_para[key].to(device) * (inner_product[net_id]/sum_inner_product)
+
 
             global_model.load_state_dict(global_w)
             #summary(global_model.to(device), (3, 32, 32))
