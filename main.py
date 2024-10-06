@@ -11,6 +11,7 @@ import datetime
 import random
 from model import *
 from utils import *
+from maskshuffle import *
 
 
 def get_args():
@@ -21,7 +22,7 @@ def get_args():
     parser.add_argument('--partition', type=str, default='noniid', help='the data partitioning strategy')
     parser.add_argument('--batch-size', type=int, default=64, help='input batch size for training (default: 64)')
     parser.add_argument('--lr', type=float, default=0.1, help='learning rate (default: 0.1)')
-    parser.add_argument('--epochs', type=int, default=10, help='number of local epochs')
+    parser.add_argument('--epochs', type=int, default=1, help='number of local epochs')
     parser.add_argument('--n_parties', type=int, default=10, help='number of workers in a distributed cluster')
     parser.add_argument('--alg', type=str, default='moon',
                         help='communication strategy: fedavg/fedprox')
@@ -53,7 +54,8 @@ def get_args():
     parser.add_argument('--save_model',type=int,default=0)
     parser.add_argument('--use_project_head', type=int, default=1)
     parser.add_argument('--server_momentum', type=float, default=0, help='the server momentum (FedAvgM)')
-    parser.add_argument('--inner', action='store_false', help='aggregation method')
+    parser.add_argument('--inner', action='store_true', help='aggregation method')
+    parser.add_argument('--mask', action='store_true', help='whether add mask to parameters')
     args = parser.parse_args()
     return args
 
@@ -510,116 +512,148 @@ if __name__ == '__main__':
                 net.load_state_dict(global_w) # 加载本轮全局模型参数
 
             # 每个客户端本地训练，返回net
-            local_train_net(nets_this_round, local_grads, args, net_dataidx_map, train_dl=train_dl, test_dl=test_dl, global_model = global_model, prev_model_pool=old_nets_pool, round=round, device=device0)
+            local_train_net(nets_this_round, local_grads, args, net_dataidx_map, train_dl=train_dl, test_dl=test_dl, global_model = global_model, prev_model_pool=old_nets_pool, round=round, device=device)
 
             total_data_points = sum([len(net_dataidx_map[r]) for r in party_list_this_round])
-            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in party_list_this_round]  # 每个客户端持有数据集数量权重
+            fed_avg_freqs = [len(net_dataidx_map[r]) / total_data_points for r in
+                             party_list_this_round]  # 每个客户端持有数据集数量权重
 
-            # 服务器聚合客户端模型参数
-            for net_id, net in enumerate(nets_this_round.values()):
-                net_para = net.state_dict()
-                if net_id == 0:
-                    for key in net_para:
-                        global_w[key] = net_para[key] * fed_avg_freqs[net_id]
-                else:
-                    for key in net_para:
-                        global_w[key] += net_para[key] * fed_avg_freqs[net_id]
+            # TODO
+            if args.mask:
+                # 客户端分组
+                groups_rounds = assign_groups(party_list_rounds)
+                groups_this_round = groups_rounds[round]
+                seeds = []
+                # 每组执行mask shuffle
+                for group in groups_this_round:
+                    seeds_group = mask_shuffle(group, n_party_per_round)
+                    seeds.append(seeds_group)
 
-            if args.server_momentum:
-                delta_w = copy.deepcopy(global_w)
-                for key in delta_w:
-                    delta_w[key] = old_w[key] - global_w[key]
-                    moment_v[key] = args.server_momentum * moment_v[key] + (1-args.server_momentum) * delta_w[key]
-                    global_w[key] = old_w[key] - moment_v[key]
+                # 向梯度添加掩码
+                masked_para = []
+                for seeds, group in zip(seeds,groups_this_round):
+                    for client in group:
+                        if client != group[-1]:
+                            pass
 
-            # 计算出全局模型参数之后可以求出全局模型梯度，然后根据每个客户端的本地参数计算出本地梯度，随后计算余弦相似度进行内积聚合
-            if args.inner:
-                glob_grad = None
+                        else:
+                            pass
 
-                # # 展平梯度计算余弦相似度
-                # # 计算全局梯度
-                # for net_id, grad in enumerate(local_grads.values()):
-                #     net_grad = copy.deepcopy(local_grads[net_id])
-                #     if glob_grad is None:
-                #         glob_grad = net_grad * fed_avg_freqs[net_id]
-                #     else:
-                #         glob_grad += net_grad * fed_avg_freqs[net_id]
-                # # 计算余弦相似度
-                # cos = torch.nn.CosineSimilarity(dim=-1)  # 创建一个计算余弦相似度的对象
-                # sim = {}
-                # sum_sim = 0
-                # for i in party_list_this_round:
-                #     sim[i] = cos(glob_grad, local_grads[i])
-                #     sum_sim += sim[i]
-                # # 内积聚合
-                # for net_id, net in enumerate(nets_this_round.values()):
-                #     net_para = net.state_dict()
-                #     if net_id == 0:
-                #         for key in net_para:
-                #             global_w[key] = net_para[key].to(device) * (sim[net_id] / sum_sim)
-                #     else:
-                #         for key in net_para:
-                #             global_w[key] += net_para[key].to(device) * (sim[net_id] / sum_sim)
 
-                # 不展平梯度计算余弦相似度
-                for net_id, net in enumerate(local_grads.values()):
-                    net_grad = copy.deepcopy(local_grads[net_id])
-                    if glob_grad is None:
-                        glob_grad = {}
-                        for i in range(len(net_grad)):
-                            glob_grad[i] = net_grad[i] * fed_avg_freqs[net_id]
-                    else:
-                        for i in range(len(net_grad)):
-                            glob_grad[i] += net_grad[i] * fed_avg_freqs[net_id]
-                # 计算余弦相似度
-                cos = torch.nn.CosineSimilarity(dim=-1)  # 创建一个计算余弦相似度的对象
-                sim = {}
-                sum_sim = None
-                for i in party_list_this_round:
-                    sim[i] = []
-                    for j in range(len(glob_grad)):
-                        sim[i].append(cos(glob_grad[j], local_grads[i][j]))
-                    if sum_sim is None:
-                        sum_sim = copy.deepcopy(sim[i])
-                    else:
-                        for k in range(len(sum_sim)):
-                            sum_sim[k] += sim[i][k]
-                # 内积聚合
+                # leader聚合本组梯度
+
+                # 聚合全局梯度
+
+
+            else:
+                # 服务器聚合客户端模型参数
                 for net_id, net in enumerate(nets_this_round.values()):
-                    net_para = net.state_dict()
+                    net_para = copy.deepcopy(net.state_dict())
+                    if args.mask:
+                        for key in net_para:
+                            net_para[key] += masked_para[net_id][key]
                     if net_id == 0:
-                        i = 0
                         for key in net_para:
-                            global_w[key] = net_para[key].to(device) * (sim[net_id][i]/sum_sim[i]).unsqueeze(-1)
-                            i += 1
+                            global_w[key] = net_para[key] * fed_avg_freqs[net_id]
                     else:
-                        i = 0
                         for key in net_para:
-                            global_w[key] += net_para[key].to(device) * (sim[net_id][i]/sum_sim[i]).unsqueeze(-1)
-                            i += 1
+                            global_w[key] += (net_para[key] * fed_avg_freqs[net_id])
 
-                # # 计算全局梯度
-                # for net_id, grad in enumerate(local_grads.values()):
-                #     net_grad = copy.deepcopy(local_grads[net_id])
-                #     if glob_grad is None:
-                #         glob_grad = net_grad * fed_avg_freqs[net_id]
-                #     else:
-                #         glob_grad += net_grad * fed_avg_freqs[net_id]
-                # # 展平梯度计算内积
-                # inner_product = {}
-                # sum_inner_product = 0
-                # for i in party_list_this_round:
-                #     inner_product[i] = torch.dot(glob_grad, local_grads[i])
-                #     sum_inner_product += inner_product[i]
-                # # 内积聚合
-                # for net_id, net in enumerate(nets_this_round.values()):
-                #     net_para = copy.deepcopy(net.state_dict())
-                #     if net_id == 0:
-                #         for key in net_para:
-                #             global_w[key] = net_para[key].to(device) * (inner_product[net_id]/sum_inner_product)
-                #     else:
-                #         for key in net_para:
-                #             global_w[key] += net_para[key].to(device) * (inner_product[net_id]/sum_inner_product)
+                if args.server_momentum:
+                    delta_w = copy.deepcopy(global_w)
+                    for key in delta_w:
+                        delta_w[key] = old_w[key] - global_w[key]
+                        moment_v[key] = args.server_momentum * moment_v[key] + (1-args.server_momentum) * delta_w[key]
+                        global_w[key] = old_w[key] - moment_v[key]
+
+                # 计算出全局模型参数之后可以求出全局模型梯度，然后根据每个客户端的本地参数计算出本地梯度，随后计算余弦相似度进行内积聚合
+                if args.inner:
+                    glob_grad = None
+
+                    # # 展平梯度计算余弦相似度
+                    # # 计算全局梯度
+                    # for net_id, grad in enumerate(local_grads.values()):
+                    #     net_grad = copy.deepcopy(local_grads[net_id])
+                    #     if glob_grad is None:
+                    #         glob_grad = net_grad * fed_avg_freqs[net_id]
+                    #     else:
+                    #         glob_grad += net_grad * fed_avg_freqs[net_id]
+                    # # 计算余弦相似度
+                    # cos = torch.nn.CosineSimilarity(dim=-1)  # 创建一个计算余弦相似度的对象
+                    # sim = {}
+                    # sum_sim = 0
+                    # for i in party_list_this_round:
+                    #     sim[i] = cos(glob_grad, local_grads[i])
+                    #     sum_sim += sim[i]
+                    # # 内积聚合
+                    # for net_id, net in enumerate(nets_this_round.values()):
+                    #     net_para = net.state_dict()
+                    #     if net_id == 0:
+                    #         for key in net_para:
+                    #             global_w[key] = net_para[key].to(device) * (sim[net_id] / sum_sim)
+                    #     else:
+                    #         for key in net_para:
+                    #             global_w[key] += net_para[key].to(device) * (sim[net_id] / sum_sim)
+
+                    # 不展平梯度计算余弦相似度
+                    for net_id, net in enumerate(local_grads.values()):
+                        net_grad = copy.deepcopy(local_grads[net_id])
+                        if glob_grad is None:
+                            glob_grad = {}
+                            for i in range(len(net_grad)):
+                                glob_grad[i] = net_grad[i] * fed_avg_freqs[net_id]
+                        else:
+                            for i in range(len(net_grad)):
+                                glob_grad[i] += net_grad[i] * fed_avg_freqs[net_id]
+                    # 计算余弦相似度
+                    cos = torch.nn.CosineSimilarity(dim=-1)  # 创建一个计算余弦相似度的对象
+                    sim = {}
+                    sum_sim = None
+                    for i in party_list_this_round:
+                        sim[i] = []
+                        for j in range(len(glob_grad)):
+                            sim[i].append(cos(glob_grad[j], local_grads[i][j]))
+                        if sum_sim is None:
+                            sum_sim = copy.deepcopy(sim[i])
+                        else:
+                            for k in range(len(sum_sim)):
+                                sum_sim[k] += sim[i][k]
+                    # 内积聚合
+                    for net_id, net in enumerate(nets_this_round.values()):
+                        net_para = net.state_dict()
+                        if net_id == 0:
+                            i = 0
+                            for key in net_para:
+                                global_w[key] = net_para[key].to(device) * (sim[net_id][i]/sum_sim[i]).unsqueeze(-1)
+                                i += 1
+                        else:
+                            i = 0
+                            for key in net_para:
+                                global_w[key] += net_para[key].to(device) * (sim[net_id][i]/sum_sim[i]).unsqueeze(-1)
+                                i += 1
+
+                    # # 计算全局梯度
+                    # for net_id, grad in enumerate(local_grads.values()):
+                    #     net_grad = copy.deepcopy(local_grads[net_id])
+                    #     if glob_grad is None:
+                    #         glob_grad = net_grad * fed_avg_freqs[net_id]
+                    #     else:
+                    #         glob_grad += net_grad * fed_avg_freqs[net_id]
+                    # # 展平梯度计算内积
+                    # inner_product = {}
+                    # sum_inner_product = 0
+                    # for i in party_list_this_round:
+                    #     inner_product[i] = torch.dot(glob_grad, local_grads[i])
+                    #     sum_inner_product += inner_product[i]
+                    # # 内积聚合
+                    # for net_id, net in enumerate(nets_this_round.values()):
+                    #     net_para = copy.deepcopy(net.state_dict())
+                    #     if net_id == 0:
+                    #         for key in net_para:
+                    #             global_w[key] = net_para[key].to(device) * (inner_product[net_id]/sum_inner_product)
+                    #     else:
+                    #         for key in net_para:
+                    #             global_w[key] += net_para[key].to(device) * (inner_product[net_id]/sum_inner_product)
 
 
             global_model.load_state_dict(global_w)
