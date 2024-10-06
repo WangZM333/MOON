@@ -28,20 +28,21 @@ class Client:
         # self.port = int("1" + id.zfill(4))
 
         self.pub_key_map = []  # 客户端列表
-        private_key, public_key = make_keypair()
+        private_key, public_key = make_keypair()  # 加密种子Paillier密文的密钥
         self.ecies_pk = public_key
         self.ecies_sk = private_key
-        paillier_pk, paillier_sk = generate_paillier_keypair(n_length=1024)
+        paillier_pk, paillier_sk = generate_paillier_keypair(n_length=1024)  # Paillier密钥加密种子
         self.paillier_pk = paillier_pk
         self.paillier_sk = paillier_sk
 
+        # 生成种子有关参数
         self.Q = Q
         self.num = num
         self.PRIME = PRIME
         self.random_state = random_state
         self.seed = gmpy2.mpz_random(self.random_state, int(self.Q / self.num))
         self.test = 1
-        self.vectorsize = vectorsize
+        self.vectorsize = vectorsize  # 梯度尺寸大小
         # self.agg_node = 0
 
         self.grad = None
@@ -53,6 +54,7 @@ class Client:
         self.agg_time = 0
         self.data_size = 0
 
+    # 生成并量化梯度
     def gen_grad(self):
         gradients = 2 * np.random.random(self.vectorsize) - 1
         self.gradients = gradients
@@ -60,11 +62,13 @@ class Client:
         scaled_gradients = gradients * scale_factor  # 将浮点数放大
         self.grad = scaled_gradients.astype(np.int32)  # 转换为32位整数
 
+    # 还原量化梯度
     def restore_grad(self, grad):
         scale_factor = 1e7  # 使用相同的缩放因子
         restored_gradients = grad.astype(np.float32) / scale_factor  # 将整数还原为浮点数
         self.restored_gradients = restored_gradients
 
+    # 添加掩码
     def add_mask(self, round):
         # 创建随机数生成器对象，并使用种子初始化
         st = time.time()
@@ -205,37 +209,10 @@ def initialize_clients(num_clients):
     return clients
 
 
-def generate_clients(num_clients):
-    return [f'client_{i+1}' for i in range(num_clients)]
-
-def select_clients(clients, num_selected):
-    return random.sample(clients, num_selected)
-
-def generate_paillier_keys(selected_clients, bit):
-    keys = {}
-    for i in range(len(selected_clients)):
-        public_key, private_key = generate_paillier_keypair(n_length=bit)
-        keys[selected_clients[i]] = (public_key, private_key)
-    return keys
-
-
 def shuffle_vector(vector):
     random.shuffle(vector)
     return vector
 
-# 根据种子和梯度向量生成对应的掩码向量
-def gen_mask(seed, modelVector):
-    vectorSize = len(modelVector)
-    mask = []
-    for i in range(0, vectorSize):
-        digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
-        digest.update(i.to_bytes(24, 'big'))
-        hx = digest.finalize()
-        hx_int = int.from_bytes(hx, "big")
-        mask.append(hx_int * int(seed))
-        masked_vector = [(modelVector[j] + int(mask[j])) for j in range(len(modelVector))]
-
-    return masked_vector
 
 def assign_groups(clients, client_ids):
     n = len(clients)
@@ -379,12 +356,12 @@ def main():
     m_et = time.time()
     mask_time = m_et - m_st
 
-    # 生成签名
-    for client in clients:
-        client.sign_gen()
-
-    # 验证签名
-    clients[-1].sign_verify(clients)
+    # # 生成签名
+    # for client in clients:
+    #     client.sign_gen()
+    #
+    # # 验证签名
+    # clients[-1].sign_verify(clients)
 
     # 梯度聚合
     ag_st = time.time()
@@ -400,12 +377,8 @@ def main():
     agg_time = ag_et - ag_st
     clients[-1].leader_time += agg_time
 
-    # 证明生成
-    pro = clients[-1].pro_gen(clients, sum_grad)
 
-    # 聚合梯度验证
-    for client in clients:
-        client.verify(clients[-1].ecies_pk, pro)
+    # TODO:聚合梯度验证
 
 
     end_time = time.time()

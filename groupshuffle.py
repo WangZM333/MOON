@@ -2,10 +2,7 @@ import time
 from maskshuffle import *
 import pickle
 
-'''
-通信开销： 梯度尺寸/客户端数量与总传输数据量关系
-         在指定网络速度的通信信道上单个客户端每轮总通信量和对应的运行时间
-'''
+
 def main():
     # 客户端初始化
     num_clients = 10
