@@ -17,6 +17,8 @@ class AggregateServer(object):
         self.sum_ready = True
         with self.condition:
             self.condition.notify_all()  # 通知等待的客户端
+        print("所有梯度计算完成，服务器即将关闭。")
+        self.shutdown_server()
 
     def submit_gradient(self, client_id, gradient):
         with self.lock:
@@ -41,6 +43,9 @@ class AggregateServer(object):
                         self.condition.wait()  # 等待服务器计算完总和
                 return self.sum.tolist()
 
+    def shutdown_server(self):
+        print("关闭服务器进程...")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
@@ -54,3 +59,7 @@ if __name__ == "__main__":
     s.bind("tcp://0.0.0.0:4242")
     print(f"服务器已启动，等待 {num_clients} 个客户端的连接。")
     s.run()
+
+'''
+python server.py 10
+'''
