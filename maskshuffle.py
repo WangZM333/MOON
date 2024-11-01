@@ -14,12 +14,12 @@ import math
 
 
 global Q, PRIME, random_state
-Q = gmpy2.next_prime(2 ** 512)  # 大于2^1024的素数
-PRIME = gmpy2.next_prime(2 ** 40)
+Q = gmpy2.next_prime(2 ** 32)  # 大于2^32的素数
+PRIME = gmpy2.next_prime(2 ** 80)
 random_state = gmpy2.random_state()
 
 global vectorsize
-vectorsize = 166337
+vectorsize = 200000
 
 class Client:
     def __init__(self, id, num):
@@ -49,22 +49,28 @@ class Client:
         self.mask = None
         self.mask_vector = None
         self.masked_grad = None
-        self.run_time = 0
+        self.maskshuffle_time = 0
         self.leader_time = 0
-        self.agg_time = 0
+        self.mask_time = 0
+        self.hash_time = 0
+        self.agg_grad_time = 0
+        self.agg_hash_time = 0
         self.data_size = 0
+        self.homohash = 0
+        self.agg_hash = 0
+        self.hash_list = []
 
     # 生成并量化梯度
     def gen_grad(self):
-        gradients = 2 * np.random.random(self.vectorsize) - 1
+        gradients = np.round(np.random.random(self.vectorsize) * 2 - 1, 4)
         self.gradients = gradients
-        scale_factor = 1e7  # 缩放因子
+        scale_factor = 1e4  # 缩放因子
         scaled_gradients = gradients * scale_factor  # 将浮点数放大
         self.grad = scaled_gradients.astype(np.int32)  # 转换为32位整数
 
     # 还原量化梯度
     def restore_grad(self, grad):
-        scale_factor = 1e7  # 使用相同的缩放因子
+        scale_factor = 1e4  # 使用相同的缩放因子
         restored_gradients = grad.astype(np.float32) / scale_factor  # 将整数还原为浮点数
         self.restored_gradients = restored_gradients
 
@@ -198,9 +204,15 @@ def homo_hash(value, key):  # x:输入同态哈希函数的值， k:同台哈希
     digest.update(key.to_bytes(24, 'big'))
     hx = digest.finalize()
     hx_int = int.from_bytes(hx, "big")
+    # ru = gmpy2.powmod(gmpy2.mpz(2), gmpy2.mpz(value), PRIME)
     ru = gmpy2.powmod(gmpy2.mpz(hx_int), gmpy2.mpz(value), PRIME)
 
     return ru
+
+# def homo_hash(value):
+#     h = scalar_mult(value, curve.g)
+#
+#     return h
 
 def initialize_clients(num_clients):
     clients = []
@@ -286,7 +298,7 @@ def mask_shuffle(clients, num_clients):
 
 def main():
     # 客户端初始化
-    num_clients = 2
+    num_clients = 10
     clients = initialize_clients(num_clients)
     client_ids = []
     grads = []
@@ -300,11 +312,11 @@ def main():
 
     seed_vector = []
     start_time = time.time()
-    for client in clients:
+    for client in clients[:-1]:
         st1 = time.time()
         # 获取当前 client 之后的客户端列表
         current_index = clients.index(client)
-        clients_after = clients[current_index + 1:]
+        clients_after = clients[current_index + 1:-1]
 
         # 加密自己的种子
         # paillier_start_time = time.time()
@@ -327,11 +339,11 @@ def main():
             for i in range(len(seed_vector)):
                 seed_vector[i].decrypt(client.ecies_sk)
 
-            if client == clients[-1]:
+            if client == clients[-2]:
                 for i in range(len(seed_vector)):  # 只有最后一次解密需要解码
                     seed_vector[i] = int(Padding.removePadding(seed_vector[i].text.decode(), mode=0))
 
-        if client != clients[-1]:
+        if client != clients[-2]:
             seed_vector.append(ciphertext)
             shuffle_vector(seed_vector)
             # seed_vector = pickle.dumps(seed_vector)
@@ -339,29 +351,36 @@ def main():
             # size = len(seed_vector) / (1024 * 1024)
             # client.data_size += size
             # print(f"seed_vector len: {size} MB")
+            et1 = time.time()
+            t1 = et1 - st1
+            client.maskshuffle_time += t1
         else:
             seed_vector.append(encrypted_number)
             sum_seed = seed_vector[0]
             for i in range(1, len(seed_vector)):
                 sum_seed *= seed_vector[i]
 
-        et1 = time.time()
-        t1 = et1 - st1
-        client.run_time += t1
+            et1 = time.time()
+            t1 = et1 - st1
+            client.leader_time += t1
+
+    clients[-1].seed = -int(clients[-1].paillier_sk.raw_decrypt(sum_seed))
 
     # 添加掩码
-    m_st = time.time()
     for client in clients:
+        m_st = time.time()
         client.add_mask(0)
-    m_et = time.time()
-    mask_time = m_et - m_st
+        m_et = time.time()
+        client.mask_time = m_et - m_st
 
-    # # 生成签名
-    # for client in clients:
-    #     client.sign_gen()
-    #
-    # # 验证签名
-    # clients[-1].sign_verify(clients)
+    # 生成梯度哈希
+    for client in clients:
+        h_st = time.time()
+        # client.homohash = homo_hash(np.sum(client.grad))
+        client.homohash = homo_hash(np.sum(client.grad), vectorsize)
+        # print(client.homohash)
+        h_et = time.time()
+        client.hash_time = h_et -h_st
 
     # 梯度聚合
     ag_st = time.time()
@@ -370,15 +389,36 @@ def main():
         # client.data_size += (len(client.masked_grad) / (1024 * 1024))
         # client.masked_grad = pickle.loads(client.masked_grad)
         sum_grad += client.masked_grad
-    sum_grad -= (int(clients[-1].paillier_sk.raw_decrypt(sum_seed)) * clients[-1].mask_vector)
     # clients[-1].agg_grad = pickle.dumps(sum_grad)
 
     ag_et = time.time()
     agg_time = ag_et - ag_st
-    clients[-1].leader_time += agg_time
+    clients[-1].agg_grad_time += agg_time
 
 
-    # TODO:聚合梯度验证
+    # 聚合梯度哈希
+    ag_h_st = time.time()
+    agg_hash = 1
+    for client in clients:
+        agg_hash = (agg_hash * client.homohash) % PRIME
+    # agg_hash = agg_hash % PRIME
+    # agg_hash = clients[0].homohash
+    # for client in clients[1:]:
+    #     agg_hash = point_add(agg_hash, client.homohash)
+    ag_h_et = time.time()
+    ag_h_t = ag_h_et - ag_h_st
+
+    # 聚合梯度验证
+    v_st = time.time()
+    # new_hash = homo_hash(np.sum(sum_grad))
+    new_hash = homo_hash(np.sum(sum_grad), vectorsize)
+    if new_hash == agg_hash:
+        print('验证通过')
+    else:
+        print('验证失败')
+        print(f"聚合哈希值{agg_hash}, 聚合梯度哈希值{new_hash}")
+    v_et = time.time()
+    vt = v_et - v_st
 
 
     end_time = time.time()
@@ -393,26 +433,28 @@ def main():
         avg_mask_time += client.mask_time
     avg_mask_time /= num_clients
 
-    avg_run_time = 0
-    leader_time = 0
+    avg_hash_time = 0
     for client in clients:
-        if client.leader_time == 0:
-            # print(f"client{client.id}'s run time: {client.run_time}")
-            avg_run_time += (client.run_time + client.mask_time)
-        else:
-            leader_time += (client.leader_time + client.run_time + client.mask_time)
-            # print(f'client{client.id} is leader, its run time is: {client.leader_time*1000}')
-    avg_run_time /= (num_clients-1)
+        avg_hash_time += client.hash_time
+    avg_hash_time /= num_clients
+
+    avg_maskshuffle_time = 0
+    for client in clients[:-2]:
+        avg_maskshuffle_time += client.maskshuffle_time
+    avg_maskshuffle_time += clients[-2].leader_time
+    avg_maskshuffle_time /= (num_clients-1)
 
     # avg_data = total_data / num_clients
     # print(f"total data size is: {total_data} MB")
     # print(f"average data size is: {avg_data} MB")
-    print('leader run time: ', leader_time*1000)
-    print('run time per client: ', avg_run_time*1000)
-    print('aggregation time: ', agg_time*1000)
+    print(f"average mask shuffle time: {avg_maskshuffle_time*1000} ms")
+    # print((f"leader aggregate seed time: {clients[-2].leader_time*1000} ms"))
+    print(f"average add mask time: {avg_mask_time*1000} ms")
+    print(f"average hash time: {avg_hash_time*1000} ms")
 
-    print('total mask time: ', mask_time)
-    print('total time: ', total_time)
+    print(f'aggregation time: {agg_time*1000} ms')
+    print(f"aggregate hash time: {ag_h_t}")
+    print(f"verification time: {vt*1000}ms")
     print('if success:', sum_grad == val_grad)
     print('sum grad: ', sum_grad)
     print('val grad: ', val_grad)
