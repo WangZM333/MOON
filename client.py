@@ -177,6 +177,7 @@ class FederatedClient:
         self.hash_list.append(message[1])
 
         if len(self.gradients_list) == len(self.all_clients_info)-1:
+            self.aggregation_start_time = time.time()
             # 如果接收到了所有其他客户端的梯度，进行聚合
             self.gradients_list.append(self.masked_grad)
             self.aggregate_and_broadcast()
@@ -186,6 +187,8 @@ class FederatedClient:
     def aggregate_and_broadcast(self):
         # 将自己的梯度和接收到的所有梯度相加
         print("开始聚合梯度数据...")
+        while len(self.hash_list) < len(self.all_clients_info):
+            time.sleep(0.001)
         agg_hash = 1
         for i in range(len(self.hash_list)):
             agg_hash *= self.hash_list[i]
@@ -201,6 +204,7 @@ class FederatedClient:
         print("聚合完成，准备将结果发送给所有客户端")
 
         # 将聚合后的梯度广播给所有客户端
+        self.broadcast_start_time = time.time()
         for client in self.all_clients_info:
             if self.client_id != client['client_id']:
                 client_id = client['client_id']
@@ -213,7 +217,6 @@ class FederatedClient:
             else:
                 self.grad = sum_gradient
                 self.aggregate = True
-
 
     def receive_aggregate(self, aggregated_grad):
         # 接收聚合梯度
@@ -266,7 +269,7 @@ class FederatedClient:
             self.send_vector(self.all_clients_info[current_index + 1]["client_id"], message)
             et1 = time.time()
             t1 = et1 - st1
-            logging.info(f"客户端{self.client_id}发送种子密文耗时{t1 * 1000}ms, 数据大小{len(message) / 1024} KB")
+            logging.info(f"客户端{self.client_id}发送种子密文耗时{t1 * 1000}ms, 种子密文数据大小{len(message) / 1024} KB")
         elif self.leader:
             paillier_pk = self.all_clients_info[-1]["paillier_pk"]
             encrypted_number = paillier_pk.raw_encrypt(int(self.seed))
@@ -285,7 +288,7 @@ class FederatedClient:
             self.send_vector(self.all_clients_info[current_index + 1]["client_id"], message)
             et1 = time.time()
             t1 = et1 - st1
-            logging.info(f"客户端{self.client_id}发送种子密文耗时{t1 * 1000}ms, 数据大小{len(message) / 1024} KB")
+            logging.info(f"客户端{self.client_id}发送种子密文耗时{t1 * 1000}ms, 种子密文数据大小{len(message) / 1024} KB")
         elif self.total_sum_holder:
             while not self.sum_seed:
                 time.sleep(0.005)
@@ -329,7 +332,7 @@ class FederatedClient:
             self.send_vector(self.group_info[current_index + 1]["client_id"], message)
             et1 = time.time()
             t1 = et1 - st1
-            logging.info(f"客户端{self.client_id}发送种子密文耗时{t1 * 1000}ms, 数据大小{len(message) / 1024} KB")
+            logging.info(f"客户端{self.client_id}发送种子密文耗时{t1 * 1000}ms, 种子密文数据大小{len(message) / 1024} KB")
         elif self.leader:
             paillier_pk = self.group_info[-1]["paillier_pk"]
             encrypted_number = paillier_pk.raw_encrypt(int(self.seed))
@@ -349,7 +352,7 @@ class FederatedClient:
             self.send_vector(self.group_info[current_index + 1]["client_id"], message)
             et1 = time.time()
             t1 = et1 - st1
-            logging.info(f"客户端{self.client_id}发送种子密文耗时{t1 * 1000}ms, 数据大小{len(message) / 1024} KB")
+            logging.info(f"客户端{self.client_id}发送种子密文耗时{t1 * 1000}ms, 种子密文数据大小{len(message) / 1024} KB")
         elif self.group_sum_holder:
             while not self.sum_seed:
                 time.sleep(0.005)
@@ -390,7 +393,7 @@ class FederatedClient:
                 self.send_vector(self.sec_shuffle[current_index + 1]["client_id"], message)
                 et1 = time.time()
                 t1 = et1 - st1
-                logging.info(f"客户端{self.client_id}发送种子密文耗时{t1 * 1000}ms, 数据大小{len(message) / 1024} KB")
+                logging.info(f"客户端{self.client_id}发送第二轮种子密文耗时{t1 * 1000}ms, 第二轮种子密文数据大小{len(message) / 1024} KB")
             elif self.leader:
                 paillier_pk = self.sec_shuffle[-1]["paillier_pk"]
                 encrypted_number = paillier_pk.raw_encrypt(int(self.sec_seed))
@@ -409,7 +412,7 @@ class FederatedClient:
                 self.send_vector(self.sec_shuffle[current_index + 1]["client_id"], message)
                 et1 = time.time()
                 t1 = et1 - st1
-                logging.info(f"客户端{self.client_id}发送种子密文耗时{t1 * 1000}ms, 数据大小{len(message) / 1024} KB")
+                logging.info(f"客户端{self.client_id}发送第二轮种子密文耗时{t1 * 1000}ms, 第二轮种子密文数据大小{len(message) / 1024} KB")
             elif self.total_sum_holder:
                 while not self.total_sum_seed:
                     time.sleep(0.005)
@@ -432,48 +435,99 @@ class FederatedClient:
         listening_thread = threading.Thread(target=self.start_server)
         listening_thread.start()
 
+        gen_grad_thread = threading.Thread(target=self.gen_grad())
+        gen_grad_thread.start()
+
+        start_time = time.time()
+
         if self.client_id == self.all_clients_info[-1]["client_id"]:
             logging.info(f"客户端 {self.client_id} 被选为聚合节点")
             self.aggregator = True
 
         if self.group_flag:
+            st1 = time.time()
+            group_shuffle_time = st1
             self.group_shuffle()
+            et1 = time.time()
+            group_time = et1 - st1
+            logging.info(f"客户端{self.client_id}运行 group shuffle 总时间 {group_time} s")
         else:
+            st1 = time.time()
+            mask_shuffle_time = st1
             self.mask_shuffle()
+            et1 = time.time()
+            group_time = et1 - st1
+            logging.info(f"客户端{self.client_id}运行 mask shuffle 总时间 {group_time} s")
 
         # 生成梯度
-        self.gen_grad()
+        # self.gen_grad()
         logging.info(f"本轮梯度{self.grad}")
         # 添加掩码
+        st2 = time.time()
+        add_mask_time = st2
         self.add_mask(0)
+        et2 = time.time()
+        mask_time = et2 - st2
+        logging.info(f"客户端{self.client_id}向梯度添加掩码耗时 {mask_time*1000} ms")
         # 生成同态哈希值
+        st3 = time.time()
+        hash_cal_time = st3
         self.hash_value = homo_hash(sum(self.grad), vectorsize)
+        et3 = time.time()
+        hash_time = et3 - st3
+        hash_end_time = et3
+        logging.info(f"客户端{self.client_id}计算本地梯度同态哈希值耗时 {hash_time * 1000} ms")
         logging.info(f"本地梯度同态哈希值{self.hash_value}")
 
         # 判断是否是最后一个客户端
         if not self.aggregator:
-            time.sleep(1)
+            # time.sleep(1)
             last_client_id = self.all_clients_info[-1]["client_id"]
-            st2 = time.time()
+            st4 = time.time()
+            send_grad_time = st4
             self.send_grad(last_client_id)
-            et2 = time.time()
-            t2 = et2 - st2
-            logging.info(f"客户端{self.client_id}发送梯度数据耗时{t2*1000}ms, 数据大小{len(pickle.dumps(self.masked_grad))/1024} KB")
+            et4 = time.time()
+            t4 = et4 - st4
+            logging.info(f"客户端{self.client_id}发送梯度数据耗时{t4*1000}ms, 梯度数据大小{len(pickle.dumps(self.masked_grad))/(1024*1024)} MB")
         else:
             self.hash_list.append(self.hash_value)
             print('聚合节点接收并聚合梯度中...')
         while not self.aggregate:
             time.sleep(0.005)
-        h = homo_hash(sum(self.grad), vectorsize)
         print('聚合完成')
+        st5 = time.time()
+        verifying_time = st5
+        h = homo_hash(sum(self.grad), vectorsize)
+        et5 = time.time()
+        veri_time = et5 - st5
+
+        end_time = time.time()
+
+        logging.info(f"客户端{self.client_id}验证聚合梯度耗时{veri_time*1000} ms")
         logging.info(f"聚合哈希值{self.agg_hash}")
         logging.info(f"聚合梯度哈希值{h}")
         logging.info(f"聚合梯度{self.grad}")
+        logging.info(f"客户端{self.client_id}启动时间：{start_time}")
+        if self.group_flag:
+            logging.info(f"客户端{self.client_id}开始运行 group shuffle 时间：{group_shuffle_time}")
+        else:
+            logging.info(f"客户端{self.client_id}开始运行 mask shuffle 时间：{mask_shuffle_time}")
+        logging.info(f"客户端{self.client_id}添加掩码时间：{add_mask_time}")
+        logging.info(f"客户端{self.client_id}计算同态哈希时间：{hash_cal_time}")
+        if not self.aggregator:
+            logging.info(f"客户端{self.client_id}发送梯度并等待时间：{send_grad_time}")
+        else:
+            logging.info(f"客户端{self.client_id}开始聚合梯度时间：{self.aggregation_start_time}")
+            logging.info(f"客户端{self.client_id}开始广播梯度时间：{self.broadcast_start_time}")
+
+        logging.info(f"客户端{self.client_id}开始验证时间：{verifying_time}")
+        logging.info(f"客户端{self.client_id}结束时间：{end_time}")
+        logging.info(f"客户端{self.client_id}运行时间：{end_time-start_time} s")
         logging.info("*" * 50 + "客户端关闭" + "*" * 50)
         pid = os.getpid()  # 获取当前进程的PID
         os.kill(pid, signal.SIGTERM)  # 主动结束指定ID的程序运行
 
-def homo_hash(value, key):  # x:输入同态哈希函数的值， k:同台哈希函数的密钥
+def homo_hash(value, key):  # x:输入同态哈希函数的值， k:同态哈希函数的密钥
     digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
     digest.update(key.to_bytes(24, 'big'))
     hx = digest.finalize()
@@ -508,8 +562,13 @@ def main():
     trusted_party_ip = sys.argv[4]
     client_id = sys.argv[5]
 
+    folder_name = "_".join(sys.argv[1:4])
+    base_dir = 'mask_shuffle_log'
+    full_folder_path = os.path.join(base_dir, folder_name)
+    os.makedirs(full_folder_path, exist_ok=True)
+
     logging.basicConfig(
-        filename=f'mask_shuffle_log/client_{client_id}.log',
+        filename=os.path.join(full_folder_path, f'client_{client_id}.log'),
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         # encoding='utf-8'
