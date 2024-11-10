@@ -1,5 +1,6 @@
 import copy
 import socket
+import threading
 import time
 import gmpy2
 from phe.paillier import *
@@ -19,7 +20,7 @@ PRIME = gmpy2.next_prime(2 ** 80)
 random_state = gmpy2.random_state()
 
 global vectorsize
-vectorsize = 200000
+vectorsize = 500000
 
 class Client:
     def __init__(self, id, num):
@@ -307,7 +308,9 @@ def main():
     val_grad = np.zeros(vectorsize, dtype=np.object_)
     for i in range(num_clients):
         client_ids.append(clients[i].id)
-        clients[i].gen_grad()
+        # clients[i].gen_grad()
+        gen_grad_thread = threading.Thread(target=clients[i].gen_grad())
+        gen_grad_thread.start()
         grads.append(clients[i].grad)
 
     seed_vector = []
@@ -319,10 +322,10 @@ def main():
         clients_after = clients[current_index + 1:-1]
 
         # 加密自己的种子
-        # paillier_start_time = time.time()
+        paillier_start_time = time.time()
         encrypted_number = clients[-1].paillier_pk.raw_encrypt(int(client.seed))
-        # paillier_end_time = time.time()
-        # paillier_time = paillier_end_time - paillier_start_time
+        paillier_end_time = time.time()
+        paillier_time = paillier_end_time - paillier_start_time
         # print('paillier time: ', paillier_time)
         ciphertext = Message(encrypted_number)
         # 逐层加密
@@ -463,6 +466,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-

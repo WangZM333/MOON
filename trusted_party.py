@@ -15,7 +15,7 @@ class TrustedParty:
         self.clients_info = []  # 存储所有客户端的信息
         self.num_clients = num_clients
         self.groups = None
-        self.sec_shuffle = None
+        self.total_sum_holder = None
         self.messages_sent = 0
         self.lock = threading.Lock()
         # self.ip = "192.168.1.100"
@@ -30,11 +30,13 @@ class TrustedParty:
             print(f"生成客户端 {client_id}，IP: {ip_address}")
 
     def group_clients(self):
-        num_groups = int(math.sqrt(self.num_clients))  # 计算组数
         group_info = copy.deepcopy(self.clients_info)
+        # 随机挑选一个客户端不参与分组
+        self.total_sum_holder = random.choice(group_info)
+        group_info.remove(self.total_sum_holder)  # 从客户端信息中移除该客户端
+        num_groups = int(math.sqrt(self.num_clients))  # 计算组数
         random.shuffle(group_info)  # 打乱客户端信息顺序
         groups = [[] for _ in range(num_groups)]  # 初始化组列表
-        sec_shuffle = []
 
         # 均匀分配客户端到组
         for idx, client in enumerate(group_info):
@@ -43,15 +45,7 @@ class TrustedParty:
             client_id, ip_address, public_key, _, paillier_pk, _ = client  # 解包信息
             groups[group_index].append((client_id, ip_address, public_key, paillier_pk))
 
-        for group in groups:
-            if group:  # 确保组不为空
-                sec_shuffle.append(group[-1])  # 添加最后一个客户端
-
         self.groups = groups
-        self.sec_shuffle = sec_shuffle
-        print(f"group info: {groups}")
-        print(f"seconde shuffle: {sec_shuffle}")
-
 
     def get_client_info(self, client_id):
         # 返回指定客户端的信息（包括公私钥）
@@ -69,7 +63,7 @@ class TrustedParty:
                 with self.lock:
                     self.messages_sent += 1
 
-                return {
+                response = {
                     "self_info": pickle.dumps({
                         "client_id": info[0],
                         "ip_address": info[1],
@@ -86,23 +80,26 @@ class TrustedParty:
                             "paillier_pk": c[4]
                         } for c in all_client_info
                     ]),
-                    "group_info": pickle.dumps([
+                    "total_sum_holder": pickle.dumps({
+                        "client_id": self.total_sum_holder[0],
+                        "ip_address": self.total_sum_holder[1],
+                        "public_key": self.total_sum_holder[2],
+                        "paillier_pk": self.total_sum_holder[4]
+                    })
+                }
+
+                # 如果客户端不是 total_sum_holder，添加 group_info
+                if client_id != self.total_sum_holder[0]:
+                    response["group_info"] = pickle.dumps([
                         {
                             "client_id": c[0],
                             "ip_address": c[1],
                             "public_key": c[2],
                             "paillier_pk": c[3]
                         } for c in group_info
-                    ]),
-                    "sec_shuffle_info": pickle.dumps([
-                        {
-                            "client_id": c[0],
-                            "ip_address": c[1],
-                            "public_key": c[2],
-                            "paillier_pk": c[3]
-                        } for c in self.sec_shuffle
                     ])
-                }
+
+                return response
 
         return None
 

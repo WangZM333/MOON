@@ -1,4 +1,5 @@
 import copy
+import math
 import signal
 import time
 import pickle
@@ -30,10 +31,10 @@ class FederatedClient:
         self.paillier_sk = None
         self.all_clients_info = []  # 存储其他客户端的信息
         self.group_info = None
-        self.sec_shuffle = None
+        self.total_sum_holder_info = None
 
         self.seed_vector = []
-        self.sec_vector = []
+        self.group_sum_seed = []
         self.sum_seed = None
         self.total_sum_seed = None
         self.sec_seed = None
@@ -78,6 +79,7 @@ class FederatedClient:
         self.sec_round = False
         self.aggregator = False
         self.leader = False
+        self.group_leader = False
 
     # 生成并量化梯度
     def gen_grad(self):
@@ -122,10 +124,12 @@ class FederatedClient:
             self.paillier_pk = self_info["paillier_pk"]
             self.paillier_sk = self_info["paillier_sk"]
             self.all_clients_info = pickle.loads(client_info["all_clients_info"])
-            self.group_info = pickle.loads(client_info['group_info'])
-            self.sec_shuffle = pickle.loads(client_info['sec_shuffle_info'])
+            self.total_sum_holder_info = pickle.loads(client_info['total_sum_holder'])
+            if self.client_id != self.total_sum_holder_info["client_id"]:
+                self.group_info = pickle.loads(client_info['group_info'])
             client.close()
             print("初始化完成，连接已关闭")
+            print(f"total_sum_holder{self.total_sum_holder_info}")
         except Exception as e:
             print(f"初始化失败: {e}")
             pid = os.getpid()  # 获取当前进程的PID
@@ -143,18 +147,14 @@ class FederatedClient:
 
     def receive_message(self, message):
         logging.info(f"客户端 {self.client_id} 收到来自前一个客户端的消息")
-        if not self.sec_round:
-            if self.group_sum_holder:
-                self.sum_seed = pickle.loads(message)
-            elif self.total_sum_holder:
+        if self.total_sum_holder:
+            if not self.group_flag:
                 self.sum_seed = pickle.loads(message)
             else:
-                self.seed_vector = pickle.loads(message)
+                self.group_sum_seed.append(pickle.loads(message))
         else:
-            if self.total_sum_holder:
-                self.total_sum_seed = pickle.loads(message)
-            else:
-                self.sec_vector = pickle.loads(message)
+            self.seed_vector = pickle.loads(message)
+
 
     def send_vector(self, target_client_id, message):
         self.start_client(target_client_id)
@@ -228,16 +228,9 @@ class FederatedClient:
 
     def layer_encrypt(self, client_info, current_index, ciphertext):
         # 倒序遍历位于自己后面的客户端
-        for client_info in reversed(client_info[current_index + 1:-1]):
+        for client_info in reversed(client_info[current_index + 1:]):
             logging.info(f"客户端{self.client_id}找到后面的客户端: {client_info['client_id']}, 公钥{client_info['public_key']}")
             ciphertext.encrypt(client_info["public_key"])
-
-    def decrypt_seed_vector(self):
-        for i in range(len(self.seed_vector)):
-            self.seed_vector[i].decrypt(self.ecies_sk)
-            if self.leader:
-                self.seed_vector[i] = int(Padding.removePadding(self.seed_vector[i].text.decode(), mode=0))
-        # return seed_vector
 
     def mask_shuffle(self):
         if self.client_id == self.all_clients_info[-2]["client_id"]:
@@ -253,7 +246,7 @@ class FederatedClient:
             encrypted_number = paillier_pk.raw_encrypt(int(self.seed))
             ciphertext = Message(encrypted_number)
 
-            self.layer_encrypt(self.all_clients_info, current_index, ciphertext)
+            self.layer_encrypt(self.all_clients_info[:-1], current_index, ciphertext)
 
             if self.client_id != self.all_clients_info[0]["client_id"]:
                 while not self.seed_vector:
@@ -303,19 +296,21 @@ class FederatedClient:
         logging.info(f"mask shuffling 完成，种子为{self.seed}")
 
     def group_shuffle(self):
-        if self.client_id == self.group_info[-2]["client_id"]:
-            logging.info(f"客户端 {self.client_id} 被选为第一轮leader")
-            self.leader = True
-        elif self.client_id == self.group_info[-1]["client_id"]:
-            logging.info(f"客户端 {self.client_id} 会进行第二轮mask shuffle")
-            self.group_sum_holder = True
+        if self.client_id != self.total_sum_holder_info["client_id"]:
+            if self.client_id == self.group_info[-1]["client_id"]:
+                print(f"客户端 {self.client_id} 被选为本组leader")
+                logging.info(f"客户端 {self.client_id} 被选为本组leader")
+                self.group_leader = True
+        else:
+            logging.info(f"客户端 {self.client_id} 持有种子总和")
+            self.total_sum_holder = True
         # 查找位于自己后面的客户端
-        current_index = next((index for index, info in enumerate(self.group_info) if info["client_id"] == self.client_id), None)
-        if not self.group_sum_holder and not self.leader:
-            paillier_pk = self.group_info[-1]["paillier_pk"]
+        if not self.total_sum_holder:
+            current_index = next((index for index, info in enumerate(self.group_info) if info["client_id"] == self.client_id), None)
+        if not self.total_sum_holder and not self.group_leader:
+            paillier_pk = self.total_sum_holder_info["paillier_pk"]
             encrypted_number = paillier_pk.raw_encrypt(int(self.seed))
             ciphertext = Message(encrypted_number)
-
             self.layer_encrypt(self.group_info, current_index, ciphertext)
 
             if self.client_id != self.group_info[0]["client_id"]:
@@ -333,8 +328,8 @@ class FederatedClient:
             et1 = time.time()
             t1 = et1 - st1
             logging.info(f"客户端{self.client_id}发送种子密文耗时{t1 * 1000}ms, 种子密文数据大小{len(message) / 1024} KB")
-        elif self.leader:
-            paillier_pk = self.group_info[-1]["paillier_pk"]
+        elif self.group_leader:
+            paillier_pk = self.total_sum_holder_info["paillier_pk"]
             encrypted_number = paillier_pk.raw_encrypt(int(self.seed))
             while not self.seed_vector:
                 time.sleep(0.005)
@@ -346,83 +341,27 @@ class FederatedClient:
             for i in range(len(self.seed_vector)):
                 encrypted_number *= self.seed_vector[i]
             ciphertext = Message(encrypted_number)
-            ciphertext.encrypt(self.group_info[current_index + 1]["public_key"])
+            ciphertext.encrypt(self.total_sum_holder_info["public_key"])
             message = pickle.dumps(ciphertext)
             st1 = time.time()
-            self.send_vector(self.group_info[current_index + 1]["client_id"], message)
+            self.send_vector(self.total_sum_holder_info["client_id"], message)
             et1 = time.time()
             t1 = et1 - st1
             logging.info(f"客户端{self.client_id}发送种子密文耗时{t1 * 1000}ms, 种子密文数据大小{len(message) / 1024} KB")
-        elif self.group_sum_holder:
-            while not self.sum_seed:
+        elif self.total_sum_holder:
+            n = int(math.sqrt(len(self.all_clients_info)-1))
+            while len(self.group_sum_seed) < n:
                 time.sleep(0.005)
-            logging.info(f"收到的聚合种子密文{self.sum_seed}")
-            self.sum_seed.decrypt(self.ecies_sk)
-            self.sum_seed = int(Padding.removePadding(self.sum_seed.text.decode(), mode=0))
-            self.sum_seed = self.paillier_sk.raw_decrypt(self.sum_seed)
-            logging.info(f"聚合种子明文{self.sum_seed}")
-            self.sec_seed = self.sum_seed + self.seed
-            logging.info(f"本组种子之和{self.sec_seed}")
-            logging.info("第二轮掩码混淆开始")
-            self.sec_round = True
-            if self.client_id == self.sec_shuffle[-2]["client_id"]:
-                logging.info(f"客户端 {self.client_id} 被选为第二轮leader")
-                self.leader = True
-            elif self.client_id == self.sec_shuffle[-1]["client_id"]:
-                logging.info(f"客户端 {self.client_id} 持有种子总和")
-                self.total_sum_holder = True
-            # 查找位于自己后面的客户端
-            current_index = next((index for index, info in enumerate(self.sec_shuffle) if info["client_id"] == self.client_id), None)
-            if not self.total_sum_holder and not self.leader:
-                paillier_pk = self.sec_shuffle[-1]["paillier_pk"]
-                encrypted_number = paillier_pk.raw_encrypt(int(self.sec_seed))
-                ciphertext = Message(encrypted_number)
-                self.layer_encrypt(self.sec_shuffle, current_index, ciphertext)
+            logging.info(f"收到的聚合种子密文{self.group_sum_seed}")
+            for i in range(len(self.group_sum_seed)):
+                self.group_sum_seed[i].decrypt(self.ecies_sk)
+                self.group_sum_seed[i] = int(Padding.removePadding(self.group_sum_seed[i].text.decode(), mode=0))
+                self.group_sum_seed[i] = self.paillier_sk.raw_decrypt(self.group_sum_seed[i])
 
-                if self.client_id != self.sec_shuffle[0]["client_id"]:
-                    while not self.sec_vector:
-                        time.sleep(0.005)
-                    print(f"second seed vector{self.sec_vector}")
-                    # 对向量中每个元素进行解密
-                    for i in range(len(self.sec_vector)):
-                        self.sec_vector[i].decrypt(self.ecies_sk)
-                self.sec_vector.append(ciphertext)
-                random.shuffle(self.sec_vector)
-                message = pickle.dumps(self.sec_vector)
-                st1 = time.time()
-                self.send_vector(self.sec_shuffle[current_index + 1]["client_id"], message)
-                et1 = time.time()
-                t1 = et1 - st1
-                logging.info(f"客户端{self.client_id}发送第二轮种子密文耗时{t1 * 1000}ms, 第二轮种子密文数据大小{len(message) / 1024} KB")
-            elif self.leader:
-                paillier_pk = self.sec_shuffle[-1]["paillier_pk"]
-                encrypted_number = paillier_pk.raw_encrypt(int(self.sec_seed))
-                while not self.sec_vector:
-                    time.sleep(0.005)
-                # 对向量中每个元素进行解密
-                for i in range(len(self.sec_vector)):
-                    self.sec_vector[i].decrypt(self.ecies_sk)
-                    self.sec_vector[i] = int(Padding.removePadding(self.sec_vector[i].text.decode(), mode=0))
-                for i in range(len(self.sec_vector)):
-                    encrypted_number *= self.sec_vector[i]
-                ciphertext = Message(encrypted_number)
-                ciphertext.encrypt(self.sec_shuffle[current_index + 1]["public_key"])
-                message = pickle.dumps(ciphertext)
-                st1 = time.time()
-                self.send_vector(self.sec_shuffle[current_index + 1]["client_id"], message)
-                et1 = time.time()
-                t1 = et1 - st1
-                logging.info(f"客户端{self.client_id}发送第二轮种子密文耗时{t1 * 1000}ms, 第二轮种子密文数据大小{len(message) / 1024} KB")
-            elif self.total_sum_holder:
-                while not self.total_sum_seed:
-                    time.sleep(0.005)
-                logging.info(f"收到的聚合种子密文{self.total_sum_seed}")
-                self.total_sum_seed.decrypt(self.ecies_sk)
-                self.total_sum_seed = int(Padding.removePadding(self.total_sum_seed.text.decode(), mode=0))
-                self.total_sum_seed = self.paillier_sk.raw_decrypt(self.total_sum_seed)
-                logging.info(f"聚合种子明文{self.total_sum_seed}")
-                self.seed = self.seed - self.sec_seed - self.total_sum_seed
-                logging.info(f"得到的新种子{self.seed}")
+            logging.info(f"聚合种子明文{self.group_sum_seed}")
+            self.seed = 0
+            for i in range(len(self.group_sum_seed)):
+                self.seed -= self.group_sum_seed[i]
 
         logging.info(f"double mask shuffling 完成，种子为{self.seed}")
 
@@ -537,8 +476,8 @@ def homo_hash(value, key):  # x:输入同态哈希函数的值， k:同态哈希
     return ru
 
 '''
-单轮： python client.py 0 200000 14 127.0.0.1 1
-双轮： python client.py 1 200000 11 127.0.0.1 1
+单轮： python client.py 0 123465 10 127.0.0.1 1
+双轮： python client.py 1 200000 10 127.0.0.1 1
 '''
 '''
 group shuffle 在大于10个客户端的情况下有bug
